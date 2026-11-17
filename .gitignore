@@ -1,0 +1,30 @@
+# 编译产物
+*.o
+*.exe
+*.obj
+*.res
+SysMonitor.exe
+unins.exe
+SysMonitorSetup.exe
+
+# 工具链 / 依赖目录
+tc/
+toolchain/
+vendor/
+
+# 生成的图标（由 res/gen_icon.py 生成）
+res/app.ico
+
+# 调试产物
+*.bmp
+*.png
+!docs/*.png
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
