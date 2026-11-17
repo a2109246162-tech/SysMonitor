@@ -38,7 +38,10 @@
 
 ### 安装
 
-**下载即用**：[Releases](https://github.com/a2109246162-tech/SysMonitor/releases) 里提供 `SysMonitor-Setup-v1.2.exe`（172 KB，免安装运行时依赖）。
+**下载即用**（二选一）：
+- 直接下载：[SysMonitor-Setup-v1.2.exe](https://github.com/a2109246162-tech/SysMonitor/raw/main/release/SysMonitor-Setup-v1.2.exe)（172 KB，免安装运行时依赖）
+- 或进入仓库 [`release/`](https://github.com/a2109246162-tech/SysMonitor/tree/main/release) 目录下载
+- 也可在 [Releases](https://github.com/a2109246162-tech/SysMonitor/releases) 页下载自动生成的源码包自行构建
 
 双击运行：
 
