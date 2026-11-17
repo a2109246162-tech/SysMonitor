@@ -28,3 +28,7 @@ res/app.ico
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# 发布包由构建生成，不入库（如需提交请用 release/ 目录）
+capture.exe
+shot.exe

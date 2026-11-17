@@ -5,6 +5,16 @@
 
 ![Windows](https://img.shields.io/badge/Windows-10%2B-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Lang](https://img.shields.io/badge/language-C%20%2B%20Win32-orange)
 
+## 截图
+
+三块贴片自由散落在桌面上，半透明圆角让壁纸清晰透出：
+
+![三块可自由拖动的贴片](docs/screenshot.png)
+
+单块贴片细节：
+
+![单块贴片](docs/tile-cpu.png)
+
 ---
 
 ## 特性
@@ -28,7 +38,9 @@
 
 ### 安装
 
-下载 `系统监控_安装程序_v1.2.exe` 双击运行：
+**下载即用**：[Releases](https://github.com/a2109246162-tech/SysMonitor/releases) 里提供 `SysMonitor-Setup-v1.2.exe`（172 KB，免安装运行时依赖）。
+
+双击运行：
 
 1. **选择安装位置** —— 下拉框列出所有磁盘及可用空间，默认选「推荐位置（当前用户，无需管理员）」；也可切到其他盘符或点「浏览…」自选目录。
 2. 点 **安装**，进度条走完即完成；勾选「立即启动」可直接运行。
@@ -173,6 +185,11 @@ res/
   app.manifest    部件清单（高 DPI）
   setup.manifest  安装程序清单
   gen_icon.py     图标生成脚本
+release/
+  SysMonitor-Setup-v1.2.exe   预编译好的安装包
+docs/
+  screenshot.png  桌面效果截图
+  tile-cpu.png    单块贴片截图
 ```
 
 ---
