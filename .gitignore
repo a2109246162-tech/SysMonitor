@@ -6,6 +6,8 @@
 SysMonitor.exe
 unins.exe
 SysMonitorSetup.exe
+!release/
+!release/SysMonitor-Setup-v1.2.exe
 
 # 工具链 / 依赖目录
 tc/
