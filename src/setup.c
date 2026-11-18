@@ -9,6 +9,7 @@
 #include <shobjidl.h>
 #include <shellapi.h>
 #include <objbase.h>
+#include <tlhelp32.h>
 #include <wchar.h>
 #include <string.h>
 #include <stdlib.h>
@@ -76,6 +77,54 @@ static void JoinPath(wchar_t *out, const wchar_t *dir, const wchar_t *name) {
         swprintf(out, MAX_PATH, L"%s%s", dir, name);
     else
         swprintf(out, MAX_PATH, L"%s\\%s", dir, name);
+}
+
+/* 找到属于指定 PID 的隐藏控制窗，发 WM_CLOSE 让它自己清理托盘/定时器后退出 */
+static BOOL CALLBACK FindCtrlByPid(HWND h, LPARAM lp) {
+    DWORD pid=0;
+    GetWindowThreadProcessId(h,&pid);
+    if (pid==(DWORD)lp) {
+        wchar_t cls[64]; GetClassNameW(h,cls,64);
+        if (wcscmp(cls,L"SysMonCtrl")==0) { PostMessageW(h,WM_CLOSE,0,0); return FALSE; }
+    }
+    return TRUE;
+}
+
+/* 精确关闭"目标路径上正在运行的 SysMonitor.exe"。
+ * 只匹配完整路径完全一致的进程，绝不按进程名批量杀。
+ * 第一轮对该 PID 的控制窗发 WM_CLOSE；若仍占用，仅对该精确 PID TerminateProcess。 */
+static void CloseRunningTarget(const wchar_t *targetExe) {
+    wchar_t want[MAX_PATH];
+    wcsncpy(want, targetExe, MAX_PATH-1); want[MAX_PATH-1]=0;
+    for (wchar_t *p=want; *p; ++p) *p=(wchar_t)towupper(*p);  /* 忽略大小写 */
+
+    for (int pass=0; pass<2; ++pass) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap==INVALID_HANDLE_VALUE) return;
+        PROCESSENTRY32W pe; pe.dwSize=sizeof(pe);
+        BOOL any=FALSE;
+        if (Process32FirstW(snap,&pe)) {
+            do {
+                HANDLE hp=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pe.th32ProcessID);
+                if (!hp) continue;
+                wchar_t img[MAX_PATH]; DWORD cch=MAX_PATH;
+                BOOL got=QueryFullProcessImageNameW(hp,0,img,&cch);
+                CloseHandle(hp);
+                if (!got) continue;
+                for (wchar_t *p=img; *p; ++p) *p=(wchar_t)towupper(*p);
+                if (wcscmp(img,want)!=0) continue;   /* 只处理目标路径那一个 */
+                any=TRUE;
+                if (pass==0) EnumWindows(FindCtrlByPid, (LPARAM)pe.th32ProcessID);
+                else {
+                    HANDLE hk=OpenProcess(PROCESS_TERMINATE,FALSE,pe.th32ProcessID);
+                    if (hk) { TerminateProcess(hk,0); CloseHandle(hk); }
+                }
+            } while (Process32NextW(snap,&pe));
+        }
+        CloseHandle(snap);
+        if (!any) return;   /* 目标 exe 已无进程占用 */
+        Sleep(600);         /* 等优雅退出完成 */
+    }
 }
 
 static BOOL EnsureDir(const wchar_t *path) {
@@ -173,11 +222,22 @@ static BOOL StepWork(int step, wchar_t *err, int errc) {
             swprintf(err, errc, L"无法创建安装目录，请换一个位置或盘符。");
             return FALSE;
         }
+        /* 关键：写文件前先精确关闭目标路径上正在运行的本软件实例，
+           否则 Windows 会锁定 exe 导致覆盖失败（这才是"写入失败"的真正原因，与权限无关） */
+        {
+            wchar_t exe[MAX_PATH];
+            JoinPath(exe, g_dir, L"SysMonitor.exe");
+            CloseRunningTarget(exe);
+        }
         return TRUE;
     case 2:
         JoinPath(p, g_dir, L"SysMonitor.exe");
         if (!WriteRes(RES_APP, p)) {
-            swprintf(err, errc, L"写入程序文件失败（目标目录可能没有写入权限）。");
+            DWORD le=GetLastError();
+            if (le==5 || le==32)   /* 拒绝访问 / 文件正被占用 */
+                swprintf(err, errc, L"写入程序文件失败：旧程序仍在运行占用文件。\n请结束系统监控后重试，或重启电脑后再安装。");
+            else
+                swprintf(err, errc, L"写入程序文件失败（错误码 %lu），请换一个安装目录。", le);
             return FALSE;
         }
         return TRUE;
