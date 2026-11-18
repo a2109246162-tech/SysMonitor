@@ -1,6 +1,8 @@
-/* SysMonitor v1.2 - 三块独立 Metro 贴片 (CPU / 内存 / GPU)
- * 每块可单独拖到桌面任意位置并记住位置；半透明、不置顶。
- * 右键菜单：开机自启 / 立即刷新 / 设置 / 关于 / 退出。
+/* SysMonitor v1.3 - 三块独立 Metro 贴片 (CPU / 内存 / GPU)
+ * 每块可单独拖到桌面任意位置并记住位置；半透明。
+ * v1.3: 去掉顶部色条；左上/左下/右下直角(仅右上圆角放图钉)；
+ *       右上角图钉按钮切换置顶/沉底；透明度支持 0(无背景)；
+ *       开机自启修复(RegCreateKeyEx + 校验当前 exe)；高 DPI 修正。
  * 纯 Win32 + C，仅 Win10+，无运行时依赖。
  */
 #include <windows.h>
@@ -27,6 +29,8 @@
 #define TRACK   RGB(46,50,62)
 #define TXT     RGB(235,239,246)
 #define TXT_DIM RGB(185,192,205)
+#define PIN_ON  RGB(255,190,60)
+#define PIN_OFF RGB(170,176,188)
 
 #define REG_APP L"Software\\SysMonitor"
 #define REG_RUN L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
@@ -35,6 +39,13 @@
 #define ID_REFRESH  1001
 #define ID_ALPHA    1002
 #define ID_AUTORUN  1003
+#define ID_CORNER   1004
+#define ID_SHOW0    1010
+#define ID_SHOW1    1011
+#define ID_SHOW2    1012
+#define ID_COLOR0   1020
+#define ID_COLOR1   1021
+#define ID_COLOR2   1022
 #define ID_OK       1
 #define ID_CANCEL   2
 
@@ -43,7 +54,7 @@
 #define ID_SETTINGS  3003
 #define ID_ABOUT     3004
 #define ID_EXIT      3005
-#define ID_FRONT     3006
+#define ID_PIN       3006
 
 #define WM_TRAY   (WM_APP + 1)
 #define WM_SHOW   (WM_APP + 2)
@@ -59,10 +70,14 @@ static HWND  g_ctrl = NULL;
 static HWND  g_tileHwnd[3] = {0};
 static HFONT g_fName, g_fNum, g_fSub, g_fDlg;
 
+/* 透明度四档：0=无背景(仅文字/进度条)、110=很透明、165=标准、215=更清晰 */
 static int g_refreshMs = 1000;
-static int g_alphaLevel = 1;
+static int g_alphaLevel = 2;
 static int g_alpha = 165;
-static const int g_alphaList[3] = { 140, 165, 200 };
+static const int g_alphaList[4] = { 0, 110, 165, 215 };
+static int g_cornerMode = 0;   /* 0=直角(默认，仅右上图钉角圆角) 1=圆角(四角) */
+static BOOL g_pinned[3] = { FALSE, FALSE, FALSE };  /* 每块独立固定 */
+static int g_pinTarget = 0;    /* 右键菜单作用的贴片索引 */
 
 static double g_cpu=0, g_mem=0, g_gpu=0;
 static ULONGLONG g_totalPhys=0, g_availPhys=0;
@@ -76,9 +91,32 @@ static BOOL g_gpuReady = FALSE;
 static NOTIFYICONDATAW g_nid;
 static BOOL g_tray = FALSE;
 
-static const COLORREF g_bg[3] = { CPU_BG, MEM_BG, GPU_BG };
-static const COLORREF g_ac[3] = { C_CPU, C_MEM, C_GPU };
+static COLORREF g_bg[3] = { CPU_BG, MEM_BG, GPU_BG };
+static COLORREF g_ac[3] = { C_CPU, C_MEM, C_GPU };
+static BOOL g_show[3] = { TRUE, TRUE, TRUE };
 static const wchar_t *g_nm[3] = { L"CPU", L"内存", L"GPU" };
+
+/* 预设颜色（每个指标可独立选择） */
+#define NCOLORS 8
+static const COLORREF g_palette[NCOLORS] = {
+    C_CPU, C_MEM, C_GPU,
+    RGB(155,89,182), RGB(46,204,113), RGB(231,76,60),
+    RGB(241,196,15), RGB(127,140,141)
+};
+static const wchar_t *g_paletteNm[NCOLORS] = {
+    L"蓝色", L"青色", L"橙色", L"紫色", L"绿色", L"红色", L"黄色", L"灰色"
+};
+static int PaletteIndexOf(COLORREF c) {
+    for (int i=0;i<NCOLORS;++i) if (g_palette[i]==c) return i;
+    return 0;
+}
+static void ApplyColors(void) {
+    /* 由强调色推导深色背景，让自定义颜色贯穿整块贴片 */
+    for (int i=0;i<3;++i) {
+        int r=GetRValue(g_ac[i]), g=GetGValue(g_ac[i]), b=GetBValue(g_ac[i]);
+        g_bg[i] = RGB(r*45/100 + 6, g*45/100 + 6, b*45/100 + 6);
+    }
+}
 
 typedef struct {
     int index;
@@ -92,7 +130,29 @@ typedef struct {
 static TILECTX g_tile[3];
 
 static void PresentTile(int idx);
-static void ApplySettings(int refreshMs, int alphaLevel, BOOL autorun);
+static void ApplySettings(int refreshMs, int alphaLevel, BOOL autorun, int cornerMode,
+                          BOOL show[3], COLORREF color[3]);
+static void ApplyPin(void);
+
+/* ---------------- DPI ---------------- */
+typedef BOOL (WINAPI *PFN_SPDAC)(void *);
+typedef UINT (WINAPI *PFN_GDFS)(void);
+typedef BOOL (WINAPI *PFN_AWRED)(LPRECT, DWORD, BOOL, DWORD, UINT);
+static void InitDpi(void) {
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    PFN_SPDAC spdac = u32 ? (PFN_SPDAC)GetProcAddress(u32, "SetProcessDpiAwarenessContext") : NULL;
+    if (spdac) spdac((void *)(INT_PTR)-4);   /* PER_MONITOR_AWARE_V2 */
+    else SetProcessDPIAware();
+    PFN_GDFS gdfs = u32 ? (PFN_GDFS)GetProcAddress(u32, "GetDpiForSystem") : NULL;
+    g_dpi = gdfs ? (int)gdfs() : 96;
+    if (g_dpi < 96) g_dpi = 96;
+}
+static void AdjustWindowRectDpi(LPRECT rc, DWORD style) {
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    PFN_AWRED aw = u32 ? (PFN_AWRED)GetProcAddress(u32, "AdjustWindowRectExForDpi") : NULL;
+    if (aw) aw(rc, style, FALSE, 0, (UINT)g_dpi);
+    else AdjustWindowRect(rc, style, FALSE);
+}
 
 /* ---------------- 注册表 ---------------- */
 static BOOL RegGetDw(const wchar_t *sub, const wchar_t *name, DWORD *out) {
@@ -123,16 +183,27 @@ static BOOL RegGetStr(const wchar_t *sub, const wchar_t *name, wchar_t *out, DWO
     RegCloseKey(k);
     return r == ERROR_SUCCESS && type == REG_SZ;
 }
+/* 开机自启：校验注册表值是否确实指向当前 exe，避免旧路径残留导致"偶发不生效" */
 static BOOL GetAutoRun(void) {
-    HKEY k; DWORD type=0, sz=0;
+    HKEY k;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN, 0, KEY_READ, &k)!=ERROR_SUCCESS) return FALSE;
-    LONG r = RegQueryValueExW(k, RUN_NM, NULL, &type, NULL, &sz);
+    wchar_t val[MAX_PATH+16]; DWORD sz=sizeof(val), type=0;
+    LONG r = RegQueryValueExW(k, RUN_NM, NULL, &type, (BYTE*)val, &sz);
     RegCloseKey(k);
-    return r == ERROR_SUCCESS;
+    if (r!=ERROR_SUCCESS || (type!=REG_SZ && type!=REG_EXPAND_SZ)) return FALSE;
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    const wchar_t *p = val;
+    if (*p==L'"') p++;
+    size_t n = wcslen(p);
+    while (n && p[n-1]==L'"') n--;
+    return (n==wcslen(exe)) && (_wcsnicmp(p, exe, n)==0);
 }
 static BOOL SetAutoRun(BOOL on) {
+    /* 关键修复：用 RegCreateKeyEx，Run 键缺失时也能创建 */
     HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN, 0, KEY_SET_VALUE, &k)!=ERROR_SUCCESS) return FALSE;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_RUN, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL)!=ERROR_SUCCESS)
+        return FALSE;
     BOOL ok;
     if (!on) {
         LONG r = RegDeleteValueW(k, RUN_NM);
@@ -144,15 +215,41 @@ static BOOL SetAutoRun(BOOL on) {
         ok = RegSetValueExW(k, RUN_NM, 0, REG_SZ, (const BYTE*)val,
                             (DWORD)((wcslen(val)+1)*sizeof(wchar_t)))==ERROR_SUCCESS;
     }
+    RegFlushKey(k);
     RegCloseKey(k);
     return ok;
 }
 static void LoadSettings(void) {
     DWORD v;
     if (RegGetDw(REG_APP, L"RefreshMs", &v) && (v==1000||v==2000||v==5000)) g_refreshMs=(int)v;
-    if (RegGetDw(REG_APP, L"AlphaLevel", &v) && v<=2) g_alphaLevel=(int)v;
-    if (g_alphaLevel<0 || g_alphaLevel>2) g_alphaLevel=1;
+    /* AlphaV2 标记：旧版 0/1/2 映射到新版 1/2/3，避免升级后档位突变 */
+    if (RegGetDw(REG_APP, L"AlphaLevel", &v)) {
+        DWORD ver=0;
+        if (!RegGetDw(REG_APP, L"AlphaV2", &ver)) {
+            if (v<=2) v=v+1;
+            RegSetDw(REG_APP, L"AlphaV2", 1);
+        }
+        if (v<=3) g_alphaLevel=(int)v;
+    }
+    if (g_alphaLevel<0 || g_alphaLevel>3) g_alphaLevel=2;
     g_alpha = g_alphaList[g_alphaLevel];
+    /* 每块独立固定状态；兼容旧版单值 Pinned */
+    if (RegGetDw(REG_APP, L"Pinned", &v)) {
+        for (int i=0;i<3;++i) g_pinned[i] = (v!=0);
+    }
+    for (int i=0;i<3;++i) {
+        wchar_t nm[32]; swprintf(nm,32,L"Pin%d",i);
+        if (RegGetDw(REG_APP, nm, &v)) g_pinned[i] = (v!=0);
+    }
+    if (RegGetDw(REG_APP, L"CornerMode", &v)) g_cornerMode = (v==1)?1:0;
+    for (int i=0;i<3;++i) {
+        wchar_t nm[32];
+        swprintf(nm,32,L"Show%d",i);
+        if (RegGetDw(REG_APP, nm, &v)) g_show[i] = (v!=0);
+        swprintf(nm,32,L"Color%d",i);
+        if (RegGetDw(REG_APP, nm, &v)) g_ac[i] = (COLORREF)v;
+    }
+    ApplyColors();
 }
 static void SavePos(int idx) {
     RECT r;
@@ -169,7 +266,7 @@ static BOOL LoadPos(int idx, int *x, int *y) {
     return swscanf(buf, L"%d,%d", x, y) == 2;
 }
 
-/* ---------------- 采样 ---------------- */
+/* ---------------- 采样（已验证，保持不变） ---------------- */
 static void SampleCPU(void) {
     FILETIME idle, kernel, user;
     if (!GetSystemTimes(&idle, &kernel, &user)) return;
@@ -280,25 +377,32 @@ static void Sheen(HDC hdc,int x,int y,int fw,int h,int off,COLORREF ac) {
 static DWORD KeyOf(COLORREF c) {
     return (DWORD)GetBValue(c)|((DWORD)GetGValue(c)<<8)|((DWORD)GetRValue(c)<<16);
 }
+/* 边角样式：直角=仅右上圆角放图钉；圆角=四角全圆角 */
 static void BuildRegion(TILECTX *tc) {
     int W=tc->w, H=tc->h, r=S(14); if (r<2) r=2;
+    if (tc->region) free(tc->region);
     tc->region=(BYTE*)malloc((size_t)W*H);
     if (!tc->region) return;
     tc->baseKey=KeyOf(g_bg[tc->index]);
     for (int y=0;y<H;++y) {
-        BOOL ye=(y<r)||(y>H-r);
         for (int x=0;x<W;++x) {
             BYTE v=1;
-            if (ye||x<r||x>W-r) {
-                BOOL in=TRUE;
-                if (x<r) {
-                    if (y<r)       { int dx=r-x,dy=r-y;      in=(dx*dx+dy*dy<=r*r); }
-                    else if (y>H-r){ int dx=r-x,dy=y-(H-r);  in=(dx*dx+dy*dy<=r*r); }
-                } else if (x>W-r) {
-                    if (y<r)       { int dx=x-(W-r),dy=r-y;      in=(dx*dx+dy*dy<=r*r); }
-                    else if (y>H-r){ int dx=x-(W-r),dy=y-(H-r);  in=(dx*dx+dy*dy<=r*r); }
+            if (g_cornerMode==1) {
+                /* 圆角：四角 */
+                int nearX = (x<r) || (x>W-r);
+                int nearY = (y<r) || (y>H-r);
+                if (nearX && nearY) {
+                    int cx = (x<r) ? r : W-r;
+                    int cy = (y<r) ? r : H-r;
+                    int dx=x-cx, dy=y-cy;
+                    if (dx*dx+dy*dy > r*r) v=0;
                 }
-                if (!in) v=0;
+            } else {
+                /* 直角：仅右上角圆角放图钉 */
+                if (x>W-r && y<r) {
+                    int dx=x-(W-r), dy=y-r;
+                    if (dx*dx+dy*dy > r*r) v=0;
+                }
             }
             tc->region[(size_t)y*W+x]=v;
         }
@@ -324,28 +428,38 @@ static void AlphaPass(TILECTX *tc) {
         }
     }
 }
+/* 右上角图钉：亮色=已固定(置顶)，灰色=未固定(沉底) */
+static void DrawPin(HDC hdc,int w,int idx) {
+    int cx=w-S(17), cy=S(17);
+    COLORREF c = g_pinned[idx] ? PIN_ON : PIN_OFF;
+    HGDIOBJ ob=SelectObject(hdc,GetStockObject(DC_BRUSH));
+    SetDCBrushColor(hdc,c);
+    Fill(hdc,cx-S(2),cy-S(1),cx+S(2),cy+S(11),c);              /* 针杆 */
+    Ellipse(hdc,cx-S(6),cy-S(9),cx+S(5),cy+S(2));              /* 圆头 */
+    SelectObject(hdc,ob);
+}
 static void DrawTileScene(TILECTX *tc) {
     HDC hdc=tc->memDC;
     int w=tc->w,h=tc->h,idx=tc->index;
     Fill(hdc,0,0,w,h,g_bg[idx]);
-    Fill(hdc,0,0,w,S(4),g_ac[idx]);
+    /* v1.3: 去掉顶部多出的色条 */
     SetBkMode(hdc,TRANSPARENT);
 
     SelectObject(hdc,g_fName); SetTextColor(hdc,TXT);
-    TextOutW(hdc,S(PAD),S(16),g_nm[idx],(int)wcslen(g_nm[idx]));
+    TextOutW(hdc,S(PAD),S(14),g_nm[idx],(int)wcslen(g_nm[idx]));
 
     double val = idx==0?g_cpu:(idx==1?g_mem:g_gpu);
     wchar_t buf[32];
     int n=swprintf(buf,32,L"%d%%",(int)(val+0.5));
     SelectObject(hdc,g_fNum); SetTextColor(hdc,TXT);
-    TextOutW(hdc,S(PAD),S(42),buf,n);
+    TextOutW(hdc,S(PAD),S(40),buf,n);
 
     if (idx==1 && g_totalPhys) {
         double used=(double)(g_totalPhys-g_availPhys)/1073741824.0;
         double tot=(double)g_totalPhys/1073741824.0;
         swprintf(buf,32,L"%.1f / %.1f GB",used,tot);
         SelectObject(hdc,g_fSub); SetTextColor(hdc,TXT_DIM);
-        TextOutW(hdc,S(PAD),S(86),buf,(int)wcslen(buf));
+        TextOutW(hdc,S(PAD),S(84),buf,(int)wcslen(buf));
     }
 
     int bx=S(PAD), bw=w-S(PAD)*2, bh=S(7), by=h-S(28);
@@ -356,6 +470,7 @@ static void DrawTileScene(TILECTX *tc) {
         Fill(hdc,bx,by,bx+fw,by+(bh>S(3)?S(2):1),Blend(g_ac[idx],55));
         Sheen(hdc,bx,by,fw,bh,g_sheen,g_ac[idx]);
     }
+    DrawPin(hdc,w,idx);
 }
 static void PresentTile(int idx) {
     TILECTX *tc=&g_tile[idx];
@@ -369,11 +484,29 @@ static void PresentTile(int idx) {
     BLENDFUNCTION bf={AC_SRC_OVER,0,255,AC_SRC_ALPHA};
     UpdateLayeredWindow(hwnd,NULL,&dst,&sz,tc->memDC,&src,0,&bf,ULW_ALPHA);
 }
+static void ApplyPinOne(int i) {
+    if (!g_tileHwnd[i]) return;
+    HWND ins = g_pinned[i] ? HWND_TOPMOST : HWND_BOTTOM;
+    SetWindowPos(g_tileHwnd[i],ins,0,0,0,0,
+                 SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+}
+static void ApplyPin(void) {
+    for (int i=0;i<3;++i) ApplyPinOne(i);
+}
+static void TogglePin(int idx) {
+    if (idx<0||idx>2) return;
+    g_pinned[idx] = !g_pinned[idx];
+    wchar_t nm[32]; swprintf(nm,32,L"Pin%d",idx);
+    RegSetDw(REG_APP, nm, g_pinned[idx]?1:0);
+    ApplyPinOne(idx);
+    if (g_tileHwnd[idx]) PostMessageW(g_tileHwnd[idx],WM_UPDATE,0,0);
+}
 
 /* ---------------- 设置窗口（代码创建，避开 rc 中文乱码） ---------------- */
 #define ID_LBL1 101
 #define ID_LBL2 102
 static HWND g_setHwnd=NULL, g_refCombo=NULL, g_alphaCombo=NULL, g_autoChk=NULL;
+static HWND g_cornerCombo=NULL, g_showChk[3]={0}, g_colorCombo[3]={0};
 
 static HWND AddCtl(HWND parent,const wchar_t *cls,const wchar_t *txt,DWORD style,
                    int x,int y,int w,int h,int id,HFONT font) {
@@ -382,42 +515,84 @@ static HWND AddCtl(HWND parent,const wchar_t *cls,const wchar_t *txt,DWORD style
     if (hw&&font) SendMessageW(hw,WM_SETFONT,(WPARAM)font,TRUE);
     return hw;
 }
-static void ApplySettings(int refreshMs,int alphaLevel,BOOL autorun) {
-    g_refreshMs=refreshMs; g_alphaLevel=alphaLevel;
+static void ApplySettings(int refreshMs,int alphaLevel,BOOL autorun,int cornerMode,
+                          BOOL show[3], COLORREF color[3]) {
+    g_refreshMs=refreshMs; g_alphaLevel=alphaLevel; g_cornerMode=cornerMode;
     g_alpha=g_alphaList[alphaLevel];
+    for (int i=0;i<3;++i) { g_show[i]=show[i]; g_ac[i]=color[i]; }
+    ApplyColors();
     RegSetDw(REG_APP,L"RefreshMs",(DWORD)refreshMs);
     RegSetDw(REG_APP,L"AlphaLevel",(DWORD)alphaLevel);
+    RegSetDw(REG_APP,L"AlphaV2",1);
+    RegSetDw(REG_APP,L"CornerMode",(DWORD)cornerMode);
+    for (int i=0;i<3;++i) {
+        wchar_t nm[32];
+        swprintf(nm,32,L"Show%d",i);
+        RegSetDw(REG_APP,nm,(DWORD)g_show[i]);
+        swprintf(nm,32,L"Color%d",i);
+        RegSetDw(REG_APP,nm,(DWORD)g_ac[i]);
+    }
     SetAutoRun(autorun);
     if (g_ctrl) {
         KillTimer(g_ctrl,1);
         SetTimer(g_ctrl,1,(UINT)g_refreshMs,NULL);
-        for (int i=0;i<3;++i)
-            if (g_tileHwnd[i]) PostMessageW(g_tileHwnd[i],WM_UPDATE,0,0);
+    }
+    for (int i=0;i<3;++i) {
+        if (!g_tileHwnd[i]) continue;
+        if (g_show[i]) {
+            BuildRegion(&g_tile[i]);      /* 重建圆角/直角区域 */
+            ShowWindow(g_tileHwnd[i], SW_SHOW);
+            PostMessageW(g_tileHwnd[i],WM_UPDATE,0,0);  /* 立即刷新外观 */
+        } else {
+            ShowWindow(g_tileHwnd[i], SW_HIDE);
+        }
     }
 }
 static INT_PTR CALLBACK SettingsProc(HWND h,UINT m,WPARAM wParam,LPARAM l) {
     switch (m) {
     case WM_CREATE: {
         const wchar_t *r3[]={L"1 秒",L"2 秒",L"5 秒"};
-        const wchar_t *a3[]={L"更透明",L"标准",L"更清晰"};
-        AddCtl(h,L"STATIC",L"刷新间隔",SS_LEFT,20,22,100,24,ID_LBL1,g_fDlg);
+        const wchar_t *a4[]={L"无背景（0）",L"很透明",L"标准",L"更清晰"};
+        const wchar_t *c2[]={L"直角（默认）",L"圆角"};
+        int y1=18, y2=62, y3=106, y4=150, yHdr=196;
+        /* 常规 */
+        AddCtl(h,L"STATIC",L"刷新间隔",SS_LEFT,20,y1+4,110,24,ID_LBL1,g_fDlg);
         g_refCombo=AddCtl(h,L"COMBOBOX",NULL,CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,
-                          130,18,260,180,ID_REFRESH,g_fDlg);
-        AddCtl(h,L"STATIC",L"透明度",SS_LEFT,20,72,100,24,ID_LBL2,g_fDlg);
+                          135,y1,235,180,ID_REFRESH,g_fDlg);
+        AddCtl(h,L"STATIC",L"透明度",SS_LEFT,20,y2+4,110,24,ID_LBL2,g_fDlg);
         g_alphaCombo=AddCtl(h,L"COMBOBOX",NULL,CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,
-                            130,68,260,180,ID_ALPHA,g_fDlg);
-        for (int i=0;i<3;++i) {
-            SendMessageW(g_refCombo,CB_ADDSTRING,0,(LPARAM)r3[i]);
-            SendMessageW(g_alphaCombo,CB_ADDSTRING,0,(LPARAM)a3[i]);
-        }
+                            135,y2,235,180,ID_ALPHA,g_fDlg);
+        AddCtl(h,L"STATIC",L"边角样式",SS_LEFT,20,y3+4,110,24,ID_LBL1,g_fDlg);
+        g_cornerCombo=AddCtl(h,L"COMBOBOX",NULL,CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,
+                             135,y3,235,180,ID_CORNER,g_fDlg);
+        g_autoChk=AddCtl(h,L"BUTTON",L"开机自动启动",BS_AUTOCHECKBOX|WS_TABSTOP,
+                         20,y4,350,28,ID_AUTORUN,g_fDlg);
+
+        for (int i=0;i<3;++i) SendMessageW(g_refCombo,CB_ADDSTRING,0,(LPARAM)r3[i]);
+        for (int i=0;i<4;++i) SendMessageW(g_alphaCombo,CB_ADDSTRING,0,(LPARAM)a4[i]);
+        for (int i=0;i<2;++i) SendMessageW(g_cornerCombo,CB_ADDSTRING,0,(LPARAM)c2[i]);
         SendMessageW(g_refCombo,CB_SETCURSEL,
                      g_refreshMs==2000?1:(g_refreshMs==5000?2:0),0);
         SendMessageW(g_alphaCombo,CB_SETCURSEL,g_alphaLevel,0);
-        g_autoChk=AddCtl(h,L"BUTTON",L"开机自动启动",BS_AUTOCHECKBOX|WS_TABSTOP,
-                         20,124,370,28,ID_AUTORUN,g_fDlg);
+        SendMessageW(g_cornerCombo,CB_SETCURSEL,g_cornerMode,0);
         SendMessageW(g_autoChk,BM_SETCHECK,GetAutoRun()?BST_CHECKED:BST_UNCHECKED,0);
-        AddCtl(h,L"BUTTON",L"确定",BS_DEFPUSHBUTTON|WS_TABSTOP,130,178,100,36,ID_OK,g_fDlg);
-        AddCtl(h,L"BUTTON",L"取消",BS_PUSHBUTTON|WS_TABSTOP,250,178,100,36,ID_CANCEL,g_fDlg);
+
+        /* 每个指标的显示开关与颜色 */
+        AddCtl(h,L"STATIC",L"指标              显示     颜色",SS_LEFT,20,yHdr,360,22,ID_LBL2,g_fDlg);
+        for (int i=0;i<3;++i) {
+            int ry=yHdr+28+i*36;
+            AddCtl(h,L"STATIC",g_nm[i],SS_LEFT,20,ry+4,110,24,ID_LBL1,g_fDlg);
+            g_showChk[i]=AddCtl(h,L"BUTTON",L"",BS_AUTOCHECKBOX|WS_TABSTOP,
+                                135,ry+3,28,26,ID_SHOW0+i,g_fDlg);
+            SendMessageW(g_showChk[i],BM_SETCHECK,g_show[i]?BST_CHECKED:BST_UNCHECKED,0);
+            g_colorCombo[i]=AddCtl(h,L"COMBOBOX",NULL,CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,
+                                   185,ry,185,150,ID_COLOR0+i,g_fDlg);
+            for (int k=0;k<NCOLORS;++k)
+                SendMessageW(g_colorCombo[i],CB_ADDSTRING,0,(LPARAM)g_paletteNm[k]);
+            SendMessageW(g_colorCombo[i],CB_SETCURSEL,PaletteIndexOf(g_ac[i]),0);
+        }
+        AddCtl(h,L"BUTTON",L"确定",BS_DEFPUSHBUTTON|WS_TABSTOP,95,yHdr+142,110,36,ID_OK,g_fDlg);
+        AddCtl(h,L"BUTTON",L"取消",BS_PUSHBUTTON|WS_TABSTOP,225,yHdr+142,110,36,ID_CANCEL,g_fDlg);
         return 0;
     }
     case WM_COMMAND: {
@@ -426,9 +601,20 @@ static INT_PTR CALLBACK SettingsProc(HWND h,UINT m,WPARAM wParam,LPARAM l) {
             static const int ms[3]={1000,2000,5000};
             int ri=(int)SendMessageW(g_refCombo,CB_GETCURSEL,0,0);
             int ai=(int)SendMessageW(g_alphaCombo,CB_GETCURSEL,0,0);
+            int ci=(int)SendMessageW(g_cornerCombo,CB_GETCURSEL,0,0);
             if (ri<0||ri>2) ri=0;
-            if (ai<0||ai>2) ai=1;
-            ApplySettings(ms[ri],ai,SendMessageW(g_autoChk,BM_GETCHECK,0,0)==BST_CHECKED);
+            if (ai<0||ai>3) ai=2;
+            if (ci<0||ci>1) ci=0;
+            BOOL show[3]; COLORREF color[3];
+            for (int i=0;i<3;++i) {
+                show[i] = SendMessageW(g_showChk[i],BM_GETCHECK,0,0)==BST_CHECKED;
+                int k=(int)SendMessageW(g_colorCombo[i],CB_GETCURSEL,0,0);
+                if (k<0||k>=NCOLORS) k=PaletteIndexOf(g_ac[i]);
+                color[i]=g_palette[k];
+            }
+            ApplySettings(ms[ri],ai,
+                          SendMessageW(g_autoChk,BM_GETCHECK,0,0)==BST_CHECKED,
+                          ci, show, color);
             DestroyWindow(h);
             return 0;
         }
@@ -440,6 +626,8 @@ static INT_PTR CALLBACK SettingsProc(HWND h,UINT m,WPARAM wParam,LPARAM l) {
         return 0;
     case WM_DESTROY:
         g_setHwnd=NULL; g_refCombo=NULL; g_alphaCombo=NULL; g_autoChk=NULL;
+        g_cornerCombo=NULL;
+        for (int i=0;i<3;++i) { g_showChk[i]=NULL; g_colorCombo[i]=NULL; }
         return 0;
     }
     return DefWindowProcW(h,m,wParam,l);
@@ -447,9 +635,12 @@ static INT_PTR CALLBACK SettingsProc(HWND h,UINT m,WPARAM wParam,LPARAM l) {
 static void OpenSettings(void) {
     if (g_setHwnd) { SetForegroundWindow(g_setHwnd); return; }
     int sw=GetSystemMetrics(SM_CXSCREEN), sh=GetSystemMetrics(SM_CYSCREEN);
-    int w=S(400), h=S(280);
-    g_setHwnd=CreateWindowExW(0,L"SysMonSettings",L"系统监控 · 设置",
-                              WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,
+    /* 客户区 400×240 逻辑像素；用 AdjustWindowRectExForDpi 算外框，避免高 DPI 裁切 */
+    RECT rc; rc.left=0; rc.top=0; rc.right=S(400); rc.bottom=S(392);
+    DWORD style=WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU;
+    AdjustWindowRectDpi(&rc, style);
+    int w=rc.right-rc.left, h=rc.bottom-rc.top;
+    g_setHwnd=CreateWindowExW(0,L"SysMonSettings",L"系统监控 · 设置",style,
                               (sw-w)/2,(sh-h)/2,w,h,NULL,NULL,g_hInst,NULL);
     if (g_setHwnd) ShowWindow(g_setHwnd,SW_SHOW);
 }
@@ -457,7 +648,7 @@ static void OpenSettings(void) {
 /* ---------------- 控制窗 ---------------- */
 static void ShowAllTiles(void) {
     for (int i=0;i<3;++i)
-        if (g_tileHwnd[i]) ShowWindow(g_tileHwnd[i],SW_SHOW);
+        if (g_tileHwnd[i] && g_show[i]) ShowWindow(g_tileHwnd[i],SW_SHOW);
     if (g_ctrl) SetForegroundWindow(g_ctrl);
 }
 static void AddTray(void) {
@@ -474,18 +665,21 @@ static void AddTray(void) {
 static void PopupMenu(void) {
     POINT p; GetCursorPos(&p);
     HMENU h=CreatePopupMenu();
+    AppendMenuW(h,MF_STRING|(g_pinned[g_pinTarget]?MF_CHECKED:MF_UNCHECKED),ID_PIN,
+                g_pinned[g_pinTarget]?L"取消固定（沉底）":L"固定到最前");
+    AppendMenuW(h,MF_SEPARATOR,0,NULL);
     AppendMenuW(h,MF_STRING|(GetAutoRun()?MF_CHECKED:MF_UNCHECKED),ID_AUTORUN_M,L"开机自启");
     AppendMenuW(h,MF_STRING,ID_REFRESH_M,L"立即刷新");
     AppendMenuW(h,MF_SEPARATOR,0,NULL);
     AppendMenuW(h,MF_STRING,ID_SETTINGS,L"设置…");
     AppendMenuW(h,MF_STRING,ID_ABOUT,L"关于…");
     AppendMenuW(h,MF_SEPARATOR,0,NULL);
-    AppendMenuW(h,MF_STRING,ID_FRONT,L"显示在桌面");
     AppendMenuW(h,MF_STRING,ID_EXIT,L"退出");
     if (g_ctrl) SetForegroundWindow(g_ctrl);
     int id=TrackPopupMenu(h,TPM_RIGHTBUTTON|TPM_RETURNCMD,p.x,p.y,0,g_ctrl,NULL);
     DestroyMenu(h);
     switch (id) {
+    case ID_PIN: TogglePin(g_pinTarget); break;
     case ID_AUTORUN_M: SetAutoRun(!GetAutoRun()); break;
     case ID_REFRESH_M:
         if (!g_gpuReady) { InitGPU(); g_gpuReady=TRUE; }
@@ -495,10 +689,9 @@ static void PopupMenu(void) {
         break;
     case ID_SETTINGS: OpenSettings(); break;
     case ID_ABOUT:
-        MessageBoxW(NULL,L"系统监控 v1.2\n\nCPU / 内存 / GPU 独立贴片，可任意拖动。\n原生 Win32，无运行时依赖。",
+        MessageBoxW(NULL,L"系统监控 v1.3\n\nCPU / 内存 / GPU 独立贴片，可任意拖动。\n右上角图钉：置顶 / 沉底。\n原生 Win32，无运行时依赖。",
                     L"关于",MB_OK|MB_ICONINFORMATION);
         break;
-    case ID_FRONT: ShowAllTiles(); break;
     case ID_EXIT:
         if (g_ctrl) DestroyWindow(g_ctrl);
         break;
@@ -506,6 +699,13 @@ static void PopupMenu(void) {
 }
 
 /* ---------------- 贴片窗口过程 ---------------- */
+static BOOL InPinArea(HWND hwnd,int idx) {
+    POINT pt; GetCursorPos(&pt);
+    RECT r; if (!GetWindowRect(hwnd,&r)) return FALSE;
+    int x=pt.x-r.left, y=pt.y-r.top;
+    int w=g_tile[idx].w;
+    return (x>=w-S(36) && y<=S(36));
+}
 static LRESULT CALLBACK TileProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l) {
     int idx=(int)(INT_PTR)GetWindowLongPtr(hwnd,0);
     TILECTX *tc=&g_tile[idx];
@@ -535,13 +735,17 @@ static LRESULT CALLBACK TileProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l) {
         PresentTile(idx);
         return 0;
     case WM_NCHITTEST:
-        /* 整块当标题栏，交给系统原生拖动（最稳定，支持任意位置） */
-        return HTCAPTION;
+        if (InPinArea(hwnd,idx)) return HTCLIENT;   /* 图钉区走普通点击 */
+        return HTCAPTION;                           /* 其余整块当标题栏拖动 */
+    case WM_LBUTTONDOWN:
+        if (InPinArea(hwnd,idx)) { TogglePin(idx); return 0; }
+        return 0;
     case WM_EXITSIZEMOVE:
-        SavePos(idx);   /* 拖完记住位置 */
+        SavePos(idx);
         return 0;
     case WM_RBUTTONUP:
-        if (g_ctrl) PostMessageW(g_ctrl,WM_POPUP,0,0);
+        g_pinTarget = idx;
+        if (g_ctrl) PostMessageW(g_ctrl,WM_POPUP,idx,0);
         return 0;
     case WM_DESTROY:
         free(tc->region); tc->region=NULL;
@@ -571,10 +775,11 @@ static LRESULT CALLBACK CtrlProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l) {
                 L"SysMonTile",NULL,WS_POPUP,x,y,wid,hei,
                 NULL,NULL,g_hInst,(LPVOID)(INT_PTR)i);
             if (g_tileHwnd[i]) {
-                ShowWindow(g_tileHwnd[i], SW_SHOW);
-                PresentTile(i);
+                ShowWindow(g_tileHwnd[i], g_show[i]?SW_SHOW:SW_HIDE);
+                if (g_show[i]) PresentTile(i);
             }
         }
+        ApplyPin();
         SampleCPU(); SampleMem();
         SetTimer(hwnd,1,(UINT)g_refreshMs,NULL);
         SetTimer(hwnd,2,50,NULL);
@@ -596,6 +801,7 @@ static LRESULT CALLBACK CtrlProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l) {
         else if (LOWORD(l)==WM_RBUTTONUP) PopupMenu();
         return 0;
     case WM_POPUP:
+        g_pinTarget = (int)w;
         PopupMenu();
         return 0;
     case WM_SHOW:
@@ -612,19 +818,63 @@ static LRESULT CALLBACK CtrlProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l) {
     return DefWindowProcW(hwnd,msg,w,l);
 }
 
+/* ---------------- 干净示例图导出（纯色背景，不含壁纸） ---------------- */
+static void SaveBmp32(const wchar_t *path,int W,int H,void *bits) {
+    BITMAPFILEHEADER bf; ZeroMemory(&bf,sizeof(bf));
+    BITMAPINFOHEADER bi; ZeroMemory(&bi,sizeof(bi));
+    bi.biSize=sizeof(BITMAPINFOHEADER); bi.biWidth=W; bi.biHeight=-H;
+    bi.biPlanes=1; bi.biBitCount=32; bi.biCompression=BI_RGB;
+    bi.biSizeImage=W*H*4;
+    bf.bfType=0x4D42; bf.bfOffBits=sizeof(bf)+sizeof(bi);
+    bf.bfSize=bf.bfOffBits+bi.biSizeImage;
+    HANDLE f=CreateFileW(path,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if (f==INVALID_HANDLE_VALUE) return;
+    DWORD wr; WriteFile(f,&bf,sizeof(bf),&wr,NULL);
+    WriteFile(f,&bi,sizeof(bi),&wr,NULL);
+    WriteFile(f,bits,W*H*4,&wr,NULL);
+    CloseHandle(f);
+}
+static void ExportDemo(const wchar_t *path) {
+    /* 固定演示数值 */
+    g_cpu=23; g_mem=68; g_gpu=7;
+    g_totalPhys=16ULL*1024*1024*1024;
+    g_availPhys=g_totalPhys*32/100;
+    g_sheen=0;
+    int gap=S(18), W=S(TILE_W)*3+gap*4, H=S(TILE_H)+gap*2;
+    HDC scr=GetDC(NULL);
+    HDC cv=CreateCompatibleDC(scr);
+    BITMAPINFO bi; ZeroMemory(&bi,sizeof(bi));
+    bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth=W; bi.bmiHeader.biHeight=-H;
+    bi.bmiHeader.biPlanes=1; bi.bmiHeader.biBitCount=32; bi.bmiHeader.biCompression=BI_RGB;
+    void *cbits=NULL;
+    HBITMAP cbmp=CreateDIBSection(scr,&bi,DIB_RGB_COLORS,&cbits,NULL,0);
+    SelectObject(cv,cbmp);
+    Fill(cv,0,0,W,H,RGB(24,28,38));   /* 纯深灰蓝背景，无壁纸 */
+    for (int i=0;i<3;++i) {
+        TILECTX tc; ZeroMemory(&tc,sizeof(tc));
+        tc.index=i; tc.w=S(TILE_W); tc.h=S(TILE_H);
+        HDC mdc=CreateCompatibleDC(scr);
+        void *mbits=NULL;
+        HBITMAP mbmp=CreateDIBSection(scr,&bi,DIB_RGB_COLORS,&mbits,NULL,0);
+        HGDIOBJ old=SelectObject(mdc,mbmp);
+        tc.memDC=mdc; tc.bits=mbits;
+        DrawTileScene(&tc);            /* 不透明场景，直接 BitBlt */
+        BitBlt(cv,gap+i*(S(TILE_W)+gap),gap,tc.w,tc.h,mdc,0,0,SRCCOPY);
+        SelectObject(mdc,old);
+        DeleteObject(mbmp); DeleteDC(mdc);
+    }
+    SaveBmp32(path,W,H,cbits);
+    DeleteObject(cbmp); DeleteDC(cv); ReleaseDC(NULL,scr);
+}
+
 int WINAPI WinMain(HINSTANCE h,HINSTANCE hp,LPSTR cmdline,int nshow) {
     g_hInst=h;
-    SetProcessDPIAware();
+    InitDpi();
     const wchar_t *cmd=GetCommandLineW();
     if (wcsstr(cmd,L"/autorun=on"))    return SetAutoRun(TRUE)?10:11;
     if (wcsstr(cmd,L"/autorun=off"))   return SetAutoRun(FALSE)?20:21;
     if (wcsstr(cmd,L"/autorun=query")) return GetAutoRun()?1:0;
-
-    HDC sdc=GetDC(NULL);
-    g_dpi=GetDeviceCaps(sdc,LOGPIXELSX);
-    ReleaseDC(NULL,sdc);
-    if (g_dpi<96) g_dpi=96;
-    LoadSettings();
 
 #define MFONT(hh,ww) CreateFontW(S(hh),0,0,0,ww,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI")
     g_fName=MFONT(13,FW_SEMIBOLD);
@@ -632,6 +882,19 @@ int WINAPI WinMain(HINSTANCE h,HINSTANCE hp,LPSTR cmdline,int nshow) {
     g_fSub=MFONT(11,FW_NORMAL);
     g_fDlg=CreateFontW(S(13),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Microsoft YaHei UI");
 #undef MFONT
+
+    /* 干净示例图导出：SysMonitor.exe /export=<path.bmp> */
+    const wchar_t *ep=wcsstr(cmd,L"/export=");
+    if (ep) {
+        const wchar_t *p=ep+8;
+        wchar_t out[MAX_PATH]; int k=0;
+        while (*p && k<MAX_PATH-1) { out[k++]=*p++; }
+        out[k]=0;
+        ExportDemo(out);
+        return 0;
+    }
+
+    LoadSettings();
 
     WNDCLASSEXW wc={0};
     wc.cbSize=sizeof(wc); wc.hInstance=h; wc.hCursor=LoadCursor(NULL,IDC_ARROW);

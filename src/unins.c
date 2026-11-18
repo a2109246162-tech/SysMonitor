@@ -24,11 +24,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     wchar_t dir[MAX_PATH];
     GetExeDir(dir);
 
-    /* 关闭正在运行的监控窗口 */
-    HWND h = FindWindowW(L"SysMonGadget", NULL);
+    /* 关闭正在运行的监控（控制窗类 SysMonCtrl） */
+    HWND h = FindWindowW(L"SysMonCtrl", NULL);
     if (h) {
         PostMessageW(h, WM_CLOSE, 0, 0);
-        Sleep(400);
+        Sleep(600);
     }
 
     /* 删除快捷方式 */
